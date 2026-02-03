@@ -340,9 +340,10 @@ fn generate_event(
     let timestamp = Timestamp::now();
 
     // Helper to generate deterministic hash from node_id and sequence
+    // Use 0x80 | prefix to ensure non-ASCII first byte (displays as hex, not string)
     let make_hash = |prefix: u8| -> [u8; 32] {
         let mut hash = [0u8; 32];
-        hash[0] = prefix;
+        hash[0] = 0x80 | prefix;
         hash[1..9].copy_from_slice(&node_id.to_le_bytes());
         hash[9..17].copy_from_slice(&sequence.to_le_bytes());
         hash
