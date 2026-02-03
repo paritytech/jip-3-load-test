@@ -87,6 +87,9 @@ Test all event tiers at low rate:
 High-frequency load testing:
 
 ```bash
+# Increase file descriptor limit first (required for many threads)
+ulimit -n 4096
+
 ./target/release/jip-3-spammer --threads 100 --preset stress --duration 60
 ```
 
@@ -226,3 +229,39 @@ Per JIP-3:
 1. Messages are length-prefixed: `[4-byte LE u32 length][SCALE-encoded content]`
 2. First message: `(PROTOCOL_VERSION, NodeInfo)` tuple
 3. Subsequent messages: `TimestampedEvent` structs
+
+## Troubleshooting
+
+### "Too many open files" error
+
+Each thread needs file descriptors for TCP sockets and the tokio runtime. Increase the limit:
+
+```bash
+# Check current limit
+ulimit -n
+
+# Increase for current session
+ulimit -n 4096
+
+# Or for many threads
+ulimit -n 65536
+```
+
+For permanent changes, edit `/etc/security/limits.conf`:
+```
+* soft nofile 65536
+* hard nofile 65536
+```
+
+### Running 1000+ nodes
+
+For large-scale tests, use multiple processes instead of many threads per process:
+
+```bash
+# 10 processes x 100 threads = 1000 nodes
+ulimit -n 4096
+for i in $(seq 0 9); do
+  ./target/release/jip-3-spammer --threads 100 --start-id $((i * 100)) &
+done
+wait
+```

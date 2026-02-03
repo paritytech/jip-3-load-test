@@ -112,32 +112,7 @@ fn main() -> anyhow::Result<()> {
         log::info!("Duration: unlimited (Ctrl+C to stop)");
     }
 
-    // Spawn worker threads
-    let mut handles = Vec::with_capacity(args.threads);
-
-    for thread_id in 0..args.threads {
-        let node_id = args.start_id + thread_id as u64;
-        let server = args.server.clone();
-        let rates = enabled_rates.clone();
-        let duration = args.duration;
-        let quiet = args.quiet;
-
-        let handle = std::thread::spawn(move || {
-            // Each thread gets its own single-threaded tokio runtime
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime");
-
-            rt.block_on(async move {
-                run_worker(node_id, &server, rates, duration, quiet).await
-            })
-        });
-
-        handles.push(handle);
-    }
-
-    // Set up Ctrl+C handler
+    // Set up Ctrl+C handler BEFORE spawning threads
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -145,12 +120,38 @@ fn main() -> anyhow::Result<()> {
         r.store(false, std::sync::atomic::Ordering::SeqCst);
     })?;
 
+    // Spawn worker threads
+    let mut handles: Vec<(u64, _)> = Vec::with_capacity(args.threads);
+
+    for thread_id in 0..args.threads {
+        let node_id = args.start_id + thread_id as u64;
+        let server = args.server.clone();
+        let rates = enabled_rates.clone();
+        let duration = args.duration;
+        let quiet = args.quiet;
+        let running = running.clone();
+
+        let handle = std::thread::spawn(move || -> anyhow::Result<()> {
+            // Each thread gets its own single-threaded tokio runtime
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to create tokio runtime: {}", e))?;
+
+            rt.block_on(async move {
+                run_worker(node_id, &server, rates, duration, quiet, &running).await
+            })
+        });
+
+        handles.push((node_id, handle));
+    }
+
     // Wait for all threads
-    for (i, handle) in handles.into_iter().enumerate() {
+    for (node_id, handle) in handles {
         match handle.join() {
-            Ok(Ok(())) => log::debug!("Thread {} finished successfully", i),
-            Ok(Err(e)) => log::error!("Thread {} failed: {}", i, e),
-            Err(_) => log::error!("Thread {} panicked", i),
+            Ok(Ok(())) => log::debug!("Thread for Node {} finished", node_id),
+            Ok(Err(e)) => log::error!("Thread for Node {} failed: {}", node_id, e),
+            Err(_) => log::error!("Thread for Node {} panicked", node_id),
         }
     }
 
@@ -164,13 +165,26 @@ async fn run_worker(
     rates: HashMap<u8, f64>,
     duration: u64,
     quiet: bool,
+    running: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
     use jam_std_common::telemetry::{NodeInfo, PROTOCOL_VERSION};
     use jam_std_common::{ed25519, PeerAddr, PeerDetails, PeerId, Truncated};
     use jam_types::{HeaderHash, ProtocolParameters};
     use tokio::net::TcpStream;
 
-    log::info!("Node {} connecting to {}", node_id, server);
+    // Generate deterministic fake IP: 10.{byte2}.{byte1}.{byte0}
+    let fake_ip = format!(
+        "10.{}.{}.{}",
+        (node_id >> 16) & 0xff,
+        (node_id >> 8) & 0xff,
+        node_id & 0xff
+    );
+    let fake_port = 30333 + (node_id % 1000) as u16;
+
+    log::info!(
+        "Node {} ({}:{}) connecting to {}",
+        node_id, fake_ip, fake_port, server
+    );
 
     // Connect to server
     let mut stream = TcpStream::connect(server).await?;
@@ -182,24 +196,24 @@ async fn run_worker(
         peer_id_bytes[0..8].copy_from_slice(&node_id.to_le_bytes());
         let peer_id = PeerId(ed25519::Public::from(peer_id_bytes));
 
-        // Deterministic IP: 10.{byte2}.{byte1}.{byte0}
-        let mut ip = [0u8; 16];
         // IPv4-mapped IPv6: ::ffff:10.x.y.z
+        let mut ip = [0u8; 16];
         ip[10] = 0xff;
         ip[11] = 0xff;
         ip[12] = 10;
         ip[13] = ((node_id >> 16) & 0xff) as u8;
         ip[14] = ((node_id >> 8) & 0xff) as u8;
         ip[15] = (node_id & 0xff) as u8;
-        let port = 30333 + (node_id % 1000) as u16;
 
         let details = PeerDetails {
             id: peer_id,
-            addr: PeerAddr { ip, port },
+            addr: PeerAddr { ip, port: fake_port },
         };
 
         // Use tiny params for testing
         let params = ProtocolParameters::tiny();
+        // Apply params so FixedVec<_, CoreCount> encodes with correct size
+        params.apply().expect("Failed to apply protocol parameters");
 
         NodeInfo {
             params,
@@ -217,21 +231,32 @@ async fn run_worker(
     let init_msg = (PROTOCOL_VERSION, &node_info);
     send_message(&mut stream, &init_msg).await?;
 
-    log::info!("Node {} sent NodeInfo", node_id);
-
     // Event generation loop
     let start = std::time::Instant::now();
     let mut sequence: u64 = 0;
 
     // Simple scheduler: iterate through enabled events based on their rates
+    // Add random offset so threads don't send events at exactly the same time
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let now = std::time::Instant::now();
     let mut next_fire: HashMap<u8, std::time::Instant> = rates
-        .keys()
-        .map(|&id| (id, std::time::Instant::now()))
+        .iter()
+        .map(|(&id, &rate)| {
+            let interval = std::time::Duration::from_secs_f64(1.0 / rate);
+            let offset = std::time::Duration::from_secs_f64(rng.random::<f64>() * interval.as_secs_f64());
+            (id, now + offset)
+        })
         .collect();
 
     loop {
         // Check duration
         if duration > 0 && start.elapsed().as_secs() >= duration {
+            break;
+        }
+
+        // Check Ctrl+C
+        if !running.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
 
