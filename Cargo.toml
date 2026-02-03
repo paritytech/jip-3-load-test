@@ -1,0 +1,30 @@
+[package]
+name = "jip-3-spammer"
+version = "0.1.0"
+edition = "2021"
+description = "Stress testing tool for JAM telemetry servers"
+
+[[bin]]
+name = "jip-3-spammer"
+path = "src/main.rs"
+
+[dependencies]
+# From polkajam workspace (via path)
+jam-std-common = { path = "../polkajam/crates/jam-std-common" }
+jam-types = { path = "../polkajam/crates/jam-types", features = ["std"] }
+
+# Core dependencies (versions matching polkajam workspace)
+codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
+bounded-collections = { version = "0.3.2", default-features = false, features = ["jam-codec"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync"] }
+clap = { version = "4.5", features = ["derive", "string"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = { version = "0.10", default-features = false, features = ["color", "auto-color", "humantime"] }
+rand = { version = "0.9", features = ["thread_rng", "small_rng"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+
+[dev-dependencies]
+
+[lints.clippy]
+unwrap_used = "deny"
