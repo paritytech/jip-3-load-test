@@ -52,14 +52,17 @@ struct Args {
     ///   network    - Connection events (tier1 + tier2)
     ///   blocks     - Block events (tier1 + tier3)
     ///   guarantees - Work package pipeline (tier1 + tier5)
-    ///   full       - All tiers at low rate
-    ///   stress     - High frequency for load testing
+    ///   stress     - 10x realistic rates for load testing
     #[arg(long, default_value = "realistic")]
     preset: String,
 
     /// Show all tiers, events, and default rates
     #[arg(long)]
     list_events: bool,
+
+    /// Show all presets with their event rates
+    #[arg(long)]
+    list_presets: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,13 +74,15 @@ fn main() -> anyhow::Result<()> {
     if args.list_events {
         println!("{}", events::tiers_help());
         println!("\nPresets:");
-        println!("  minimal    - Status only");
-        println!("  realistic  - Matches JIP-3 spec timing (default)");
-        println!("  network    - Connection events (tier1 + tier2)");
-        println!("  blocks     - Block events (tier1 + tier3)");
-        println!("  guarantees - Work package pipeline (tier1 + tier5)");
-        println!("  full       - All tiers at low rate");
-        println!("  stress     - High frequency for load testing");
+        for (name, desc) in events::PRESETS {
+            println!("  {:<12} - {}", name, desc);
+        }
+        return Ok(());
+    }
+
+    // Handle --list-presets
+    if args.list_presets {
+        print!("{}", events::list_presets());
         return Ok(());
     }
 
@@ -235,6 +240,9 @@ async fn run_worker(
     let start = std::time::Instant::now();
     let mut sequence: u64 = 0;
 
+    // Per-event-type counters for events that need sequential numbering (e.g., slots)
+    let mut event_counts: HashMap<u8, u64> = HashMap::new();
+
     // Simple scheduler: iterate through enabled events based on their rates
     // Add random offset so threads don't send events at exactly the same time
     use rand::Rng;
@@ -273,14 +281,16 @@ async fn run_worker(
         }
 
         // Generate and send event
-        let event = generate_event(next_id, node_id, sequence)?;
+        let event_count = *event_counts.get(&next_id).unwrap_or(&0);
+        let event = generate_event(next_id, node_id, sequence, event_count)?;
         send_message(&mut stream, &event).await?;
 
         if !quiet {
-            log::debug!("Node {} sent event {} (seq {})", node_id, next_id, sequence);
+            log::debug!("Node {} sent event {} (seq {}, count {})", node_id, next_id, sequence, event_count);
         }
 
         sequence += 1;
+        *event_counts.entry(next_id).or_insert(0) += 1;
 
         // Schedule next fire for this event
         let rate = rates[&next_id];
@@ -316,10 +326,12 @@ async fn send_message<T: codec::Encode>(
 }
 
 /// Generate a telemetry event by ID.
+/// `event_count` is the per-event-type counter (used for sequential values like slots).
 fn generate_event(
     event_id: u8,
     node_id: u64,
     sequence: u64,
+    event_count: u64,
 ) -> anyhow::Result<jam_std_common::telemetry::TimestampedEvent> {
     use bounded_collections::BoundedVec;
     use jam_std_common::telemetry::{
@@ -450,12 +462,12 @@ fn generate_event(
         }),
 
         11 => Event::BestBlockChanged(event::BestBlockChanged {
-            slot: Slot::from(sequence as u32),
+            slot: Slot::from(event_count as u32),
             hash: HeaderHash(make_hash(0x11)),
         }),
 
         12 => Event::FinalizedBlockChanged(event::FinalizedBlockChanged {
-            slot: Slot::from(sequence as u32),
+            slot: Slot::from(event_count as u32),
             hash: HeaderHash(make_hash(0x12)),
         }),
 
