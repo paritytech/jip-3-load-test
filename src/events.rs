@@ -108,10 +108,10 @@ pub const TIERS: &[TierDef] = &[
             EventDef { id: 84, name: "TicketTransferred", default_rate: 1.137 },
         ],
     },
-    // Work package and guarantee events (90-113)
+    // Work package events (90-104)
     TierDef {
-        name: "guaranteeing",
-        description: "Work package and guarantee events",
+        name: "work-package",
+        description: "Work package submission, sharing, and refinement events",
         events: &[
             // ~1/slot = 0.167/s
             EventDef { id: 90, name: "WorkPackageSubmission", default_rate: 0.167 },
@@ -134,6 +134,13 @@ pub const TIERS: &[TierDef] = &[
             // ~0.67/slot = 0.112/s
             EventDef { id: 103, name: "WorkReportSignatureSent", default_rate: 0.112 },
             EventDef { id: 104, name: "WorkReportSignatureReceived", default_rate: 0.112 },
+        ],
+    },
+    // Guarantee events (105-113)
+    TierDef {
+        name: "guaranteeing",
+        description: "Guarantee building and distribution events",
+        events: &[
             // ~0.33/slot = 0.055/s
             EventDef { id: 105, name: "GuaranteeBuilt", default_rate: 0.055 },
             // ~340/slot = 56.67/s (C × (V-G))
@@ -396,7 +403,7 @@ pub const PRESETS: &[(&str, &str)] = &[
     ("realistic-with-audits", "Full-load rates including auditing events"),
     ("network", "Connection events (status + networking)"),
     ("blocks", "Block events (status + blocks)"),
-    ("guarantees", "Work package pipeline (status + guaranteeing)"),
+    ("guarantees", "Work package pipeline (status + work-package + guaranteeing)"),
     ("stress", "10x realistic rates for load testing"),
 ];
 
@@ -417,7 +424,7 @@ pub fn preset_rates(name: &str) -> anyhow::Result<HashMap<u8, f64>> {
         "realistic-with-audits" => Ok(default_rates()),
         "network" => parse_rates("status:0.5,networking:0.1"),
         "blocks" => parse_rates("status:0.5,blocks:0.167"),
-        "guarantees" => parse_rates("status:0.5,guaranteeing:0.1"),
+        "guarantees" => parse_rates("status:0.5,work-package:0.1,guaranteeing:0.1"),
         "stress" => Ok(default_rates().into_iter().map(|(id, rate)| (id, rate * 10.0)).collect()),
         _ => {
             let preset_names: Vec<_> = PRESETS.iter().map(|(n, _)| *n).collect();
@@ -553,8 +560,8 @@ mod tests {
 
     #[test]
     fn test_all_tiers_exist() {
-        let expected_tiers = ["status", "networking", "blocks", "tickets", "guaranteeing",
-                             "availability", "auditing", "segments", "preimages"];
+        let expected_tiers = ["status", "networking", "blocks", "tickets", "work-package",
+                             "guaranteeing", "availability", "auditing", "segments", "preimages"];
         for name in expected_tiers {
             assert!(find_tier(name).is_some(), "Tier '{}' should exist", name);
         }

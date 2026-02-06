@@ -51,7 +51,7 @@ struct Args {
     ///   realistic  - Matches JIP-3 spec timing (default)
     ///   network    - Connection events (tier1 + tier2)
     ///   blocks     - Block events (tier1 + tier3)
-    ///   guarantees - Work package pipeline (tier1 + tier5)
+    ///   guarantees - Work package pipeline (status + work-package + guaranteeing)
     ///   stress     - 10x realistic rates for load testing
     #[arg(long, default_value = "realistic")]
     preset: String,
