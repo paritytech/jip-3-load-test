@@ -23,6 +23,7 @@ log = "0.4"
 env_logger = { version = "0.10", default-features = false, features = ["color", "auto-color", "humantime"] }
 rand = { version = "0.9", features = ["thread_rng", "small_rng"] }
 ctrlc = { version = "3.4", features = ["termination"] }
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 
