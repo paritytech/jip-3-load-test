@@ -265,3 +265,12 @@ for i in $(seq 0 9); do
 done
 wait
 ```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Built for the [JAM (Join-Accumulate Machine)](https://graypaper.com/) protocol
+- Specification: JIP-3 Telemetry
