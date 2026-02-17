@@ -9,11 +9,9 @@ name = "jip-3-spammer"
 path = "src/main.rs"
 
 [dependencies]
-# From polkajam workspace (via path)
-jam-std-common = { path = "../polkajam/crates/jam-std-common" }
-jam-types = { path = "../polkajam/crates/jam-types", features = ["std"] }
+jam-std-common = "0.1.26"
+jam-types = { version = "0.1.26", features = ["std"] }
 
-# Core dependencies (versions matching polkajam workspace)
 codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
 bounded-collections = { version = "0.3.2", default-features = false, features = ["jam-codec"] }
 tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync"] }

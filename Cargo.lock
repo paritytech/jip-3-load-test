@@ -1041,7 +1041,9 @@ dependencies = [
 
 [[package]]
 name = "jam-std-common"
-version = "0.1.27"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7be032d64529ef55738efbb6baa36406206e43bad601c0011b929aa471510bf"
 dependencies = [
  "ark-vrf",
  "async-trait",
@@ -1062,7 +1064,9 @@ dependencies = [
 
 [[package]]
 name = "jam-types"
-version = "0.1.27"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6344ccd69db19da96fe1b7d227edea965365278ab345b84d5880572c5ad06de1"
 dependencies = [
  "atomic-traits",
  "base64",
