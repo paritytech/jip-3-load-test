@@ -21,6 +21,7 @@ Options:
     -q, --quiet          Suppress per-event logging
     --rate <SPEC>        Set frequency for events (see Rate Control)
     --preset <NAME>      Use preset rate configuration (default: realistic)
+    --ramp-up <SECS>     Spread connections over SECS window (default: auto ~200/s)
     --list-events        Show all tiers, events, and default rates
 ```
 
@@ -137,6 +138,9 @@ Or for full 1024 nodes:
 
 wait
 ```
+
+> Note: ramp-up is per-process. When launching several processes, the aggregate
+> connection rate is the sum across processes, so size `--ramp-up` accordingly.
 
 ### 11. Quiet Mode (Production Load Test)
 

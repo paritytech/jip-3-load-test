@@ -85,6 +85,14 @@ struct Args {
     /// Default delivery latency in milliseconds for receive-side events
     #[arg(long, default_value = "6000")]
     latency_ms: u64,
+
+    /// Ramp-up window in seconds over which node connections are opened.
+    ///
+    /// If omitted, a window is chosen automatically so connections open at a
+    /// fixed ~200/s (~5ms apart) regardless of --threads. Pass an explicit
+    /// value to override, or 0 to open all connections immediately.
+    #[arg(long)]
+    ramp_up: Option<f64>,
 }
 
 /// An event scheduled for delayed delivery on a specific thread.
@@ -153,6 +161,10 @@ const PAIR_RECEIVE_EVENTS: &[u8] = &[
     64,  // ReceivingBlockRequest (from 63)
     91,  // WorkPackageBeingShared (from 98)
 ];
+
+/// Default connection-establishment rate (connections/second) used when
+/// --ramp-up is not given.
+const DEFAULT_CONNECT_RATE_PER_SEC: f64 = 200.0;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -237,6 +249,20 @@ fn main() -> anyhow::Result<()> {
 
     let pairs_per_node = args.pairs_per_node;
 
+    if let Some(v) = args.ramp_up {
+        if v < 0.0 {
+            anyhow::bail!("--ramp-up must be non-negative");
+        }
+    }
+    let ramp_up_secs = args
+        .ramp_up
+        .unwrap_or(args.threads as f64 / DEFAULT_CONNECT_RATE_PER_SEC);
+    let ramp_up_interval = if ramp_up_secs > 0.0 && args.threads > 0 {
+        std::time::Duration::from_secs_f64(ramp_up_secs / args.threads as f64)
+    } else {
+        std::time::Duration::ZERO
+    };
+
     log::info!(
         "Starting {} thread(s) connecting to {}",
         args.threads,
@@ -250,6 +276,19 @@ fn main() -> anyhow::Result<()> {
             "Pair-wise mode: {} validators, {} pairs/node, {}ms latency",
             num_validators, pairs_per_node, args.latency_ms
         );
+    }
+
+    if !ramp_up_interval.is_zero() {
+        log::info!(
+            "Ramp-up: {} connection(s) over {:.2}s (~{:.0} conn/s, {:.0}ms apart){}",
+            args.threads,
+            ramp_up_secs,
+            args.threads as f64 / ramp_up_secs,
+            ramp_up_interval.as_secs_f64() * 1000.0,
+            if args.ramp_up.is_none() { " [auto]" } else { "" }
+        );
+    } else {
+        log::info!("Ramp-up: disabled");
     }
 
     if args.duration > 0 {
@@ -272,6 +311,7 @@ fn main() -> anyhow::Result<()> {
     #[allow(clippy::needless_range_loop)]
     for thread_id in 0..args.threads {
         let node_id = args.start_id + thread_id as u64;
+        let connect_delay = ramp_up_interval.mul_f64(thread_id as f64);
         let server = args.server.clone();
         let rates = enabled_rates.clone();
         let duration = args.duration;
@@ -306,6 +346,7 @@ fn main() -> anyhow::Result<()> {
                     receiver,
                     latency_config,
                     pairs_per_node,
+                    connect_delay,
                 )
                 .await
             })
@@ -341,6 +382,8 @@ async fn run_worker(
     receiver: Option<crossbeam_channel::Receiver<ScheduledEvent>>,
     latency_config: Option<std::sync::Arc<LatencyConfig>>,
     pairs_per_node: usize,
+    // Ramp-up delay: how long this worker waits before opening its connection.
+    connect_delay: std::time::Duration,
 ) -> anyhow::Result<()> {
     use jam_std_common::telemetry::{NodeInfo, PROTOCOL_VERSION};
     use jam_std_common::{ed25519, PeerAddr, PeerDetails, PeerId, Truncated};
@@ -355,6 +398,21 @@ async fn run_worker(
         node_id & 0xff
     );
     let fake_port = 30333 + (node_id % 1000) as u16;
+
+    if !connect_delay.is_zero() {
+        let deadline = std::time::Instant::now() + connect_delay;
+        loop {
+            if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                log::info!("Node {} aborted during ramp-up wait", node_id);
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
+        }
+    }
 
     log::info!(
         "Node {} ({}:{}) connecting to {}",
