@@ -93,6 +93,21 @@ struct Args {
     /// value to override, or 0 to open all connections immediately.
     #[arg(long)]
     ramp_up: Option<f64>,
+
+    /// Disable automatic reconnection.
+    ///
+    /// By default a node whose connection drops (or which cannot connect yet)
+    /// retries with exponential backoff, so the load survives a server restart.
+    /// With this flag a dropped/failed connection ends that node instead.
+    #[arg(long)]
+    no_reconnect: bool,
+
+    /// Maximum backoff between reconnection attempts, in seconds.
+    ///
+    /// Reconnects use exponential backoff with full jitter (uniform in
+    /// [0, current_cap]) so a server restart doesn't trigger a thundering herd.
+    #[arg(long, default_value = "10.0")]
+    reconnect_max_backoff: f64,
 }
 
 /// An event scheduled for delayed delivery on a specific thread.
@@ -165,6 +180,10 @@ const PAIR_RECEIVE_EVENTS: &[u8] = &[
 /// Default connection-establishment rate (connections/second) used when
 /// --ramp-up is not given.
 const DEFAULT_CONNECT_RATE_PER_SEC: f64 = 200.0;
+
+/// Base delay for reconnection backoff. The cap doubles each attempt from here
+/// up to --reconnect-max-backoff; the actual wait is jittered within [0, cap].
+const RECONNECT_BASE_BACKOFF_MS: u64 = 100;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -291,6 +310,19 @@ fn main() -> anyhow::Result<()> {
         log::info!("Ramp-up: disabled");
     }
 
+    if args.no_reconnect {
+        log::info!("Reconnect: disabled (a dropped connection ends the node)");
+    } else {
+        if args.reconnect_max_backoff <= 0.0 || !args.reconnect_max_backoff.is_finite() {
+            anyhow::bail!("--reconnect-max-backoff must be a positive, finite number of seconds");
+        }
+        log::info!(
+            "Reconnect: enabled (exponential backoff up to {:.1}s, jittered)",
+            args.reconnect_max_backoff
+        );
+    }
+    let reconnect_max_backoff = std::time::Duration::from_secs_f64(args.reconnect_max_backoff);
+
     if args.duration > 0 {
         log::info!("Duration: {} seconds", args.duration);
     } else {
@@ -316,6 +348,7 @@ fn main() -> anyhow::Result<()> {
         let rates = enabled_rates.clone();
         let duration = args.duration;
         let quiet = args.quiet;
+        let no_reconnect = args.no_reconnect;
         let running = running.clone();
         let registry = registry.clone();
         let latency_config = latency_config.clone();
@@ -347,6 +380,8 @@ fn main() -> anyhow::Result<()> {
                     latency_config,
                     pairs_per_node,
                     connect_delay,
+                    no_reconnect,
+                    reconnect_max_backoff,
                 )
                 .await
             })
@@ -384,11 +419,12 @@ async fn run_worker(
     pairs_per_node: usize,
     // Ramp-up delay: how long this worker waits before opening its connection.
     connect_delay: std::time::Duration,
+    no_reconnect: bool,
+    reconnect_max_backoff: std::time::Duration,
 ) -> anyhow::Result<()> {
-    use jam_std_common::telemetry::{NodeInfo, PROTOCOL_VERSION};
+    use jam_std_common::telemetry::NodeInfo;
     use jam_std_common::{ed25519, PeerAddr, PeerDetails, PeerId, Truncated};
     use jam_types::{HeaderHash, ProtocolParameters};
-    use tokio::net::TcpStream;
 
     // Generate deterministic fake IP: 10.{byte2}.{byte1}.{byte0}
     let fake_ip = format!(
@@ -399,30 +435,7 @@ async fn run_worker(
     );
     let fake_port = 30333 + (node_id % 1000) as u16;
 
-    if !connect_delay.is_zero() {
-        let deadline = std::time::Instant::now() + connect_delay;
-        loop {
-            if !running.load(std::sync::atomic::Ordering::Relaxed) {
-                log::info!("Node {} aborted during ramp-up wait", node_id);
-                return Ok(());
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
-        }
-    }
-
-    log::info!(
-        "Node {} ({}:{}) connecting to {}",
-        node_id, fake_ip, fake_port, server
-    );
-
-    // Connect to server
-    let mut stream = TcpStream::connect(server).await?;
-
-    // Generate NodeInfo
+    // Build NodeInfo once; it is deterministic and reused across reconnects.
     let node_info = {
         // Deterministic peer ID from node_id
         let mut peer_id_bytes = [0u8; 32];
@@ -460,121 +473,216 @@ async fn run_worker(
         }
     };
 
-    // Send initial message: (PROTOCOL_VERSION, NodeInfo)
-    let init_msg = (PROTOCOL_VERSION, &node_info);
-    send_message(&mut stream, &init_msg).await?;
+    // Ramp-up: wait our staggered slot before the FIRST connection so the
+    // server's listen() backlog isn't hit by every node at once. Interruptible
+    // so Ctrl+C aborts a long ramp-up promptly.
+    if !connect_delay.is_zero() && !interruptible_sleep(connect_delay, running).await {
+        log::info!("Node {} aborted during ramp-up wait", node_id);
+        return Ok(());
+    }
 
-    // Event generation loop
+    // Event-generation state that persists across reconnects. `sequence` and the
+    // per-event-type counters keep advancing, so the server-side monotonic
+    // checks stay meaningful (a reconnect shows up as a gap, not a reset).
     let start = std::time::Instant::now();
     let mut sequence: u64 = 0;
-
-    // Per-event-type counters for events that need sequential numbering (e.g., slots)
     let mut event_counts: HashMap<u8, u64> = HashMap::new();
-
     // Pair-wise: delay queue for events received from other threads
     let mut delay_queue: std::collections::BinaryHeap<ScheduledEvent> =
         std::collections::BinaryHeap::new();
     let my_index = registry.as_ref().and_then(|r| r.index_of_node(node_id));
 
-    // Simple scheduler: iterate through enabled events based on their rates
-    // Add random offset so threads don't send events at exactly the same time
     use rand::Rng;
     let mut rng = rand::rng();
-    let now = std::time::Instant::now();
-    let mut next_fire: HashMap<u8, std::time::Instant> = rates
-        .iter()
-        .map(|(&id, &rate)| {
-            let interval = std::time::Duration::from_secs_f64(1.0 / rate);
-            let offset = std::time::Duration::from_secs_f64(rng.random::<f64>() * interval.as_secs_f64());
-            (id, now + offset)
-        })
-        .collect();
+    let mut reconnect_attempt: u32 = 0;
 
-    loop {
-        // Check duration
-        if duration > 0 && start.elapsed().as_secs() >= duration {
-            break;
-        }
-
-        // Check Ctrl+C
+    // Reconnect loop: (re)establish the connection, run the event loop until it
+    // drops, then back off and try again (unless --no-reconnect). This keeps the
+    // simulated load alive across Tart restarts.
+    'reconnect: loop {
         if !running.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
+            break 'reconnect;
+        }
+        if duration > 0 && start.elapsed().as_secs() >= duration {
+            break 'reconnect;
         }
 
+        log::info!(
+            "Node {} ({}:{}) connecting to {}{}",
+            node_id,
+            fake_ip,
+            fake_port,
+            server,
+            if reconnect_attempt > 0 {
+                format!(" (attempt {})", reconnect_attempt + 1)
+            } else {
+                String::new()
+            }
+        );
+
+        let mut stream = match connect_and_init(server, &node_info).await {
+            Ok(stream) => {
+                if reconnect_attempt > 0 {
+                    log::info!(
+                        "Node {} reconnected after {} failed attempt(s)",
+                        node_id, reconnect_attempt
+                    );
+                }
+                reconnect_attempt = 0;
+                stream
+            }
+            Err(e) => {
+                if no_reconnect {
+                    return Err(e);
+                }
+                reconnect_attempt += 1;
+                let backoff = reconnect_backoff(reconnect_attempt, reconnect_max_backoff, &mut rng);
+                log::warn!(
+                    "Node {} connect failed: {} — retrying in {:.1}s",
+                    node_id,
+                    e,
+                    backoff.as_secs_f64()
+                );
+                if !interruptible_sleep(backoff, running).await {
+                    break 'reconnect;
+                }
+                continue 'reconnect;
+            }
+        };
+
+        // Rebuild the fire schedule from now and drop any stale inbound events,
+        // so downtime doesn't unleash a catch-up burst on reconnect. A random
+        // sub-interval offset keeps nodes from firing in lockstep.
         let now = std::time::Instant::now();
-
-        // Step 1: Drain inbox from crossbeam channel into delay queue
-        if let Some(ref rx) = receiver {
-            while let Ok(evt) = rx.try_recv() {
-                delay_queue.push(evt);
-            }
-        }
-
-        // Step 2: Emit ready events from delay queue
-        while delay_queue.peek().is_some_and(|e| e.delivery_time <= now) {
-            if let Some(scheduled) = delay_queue.pop() {
-                send_message(&mut stream, &scheduled.event).await?;
-            }
-        }
-
-        // Find next event to fire
-        let (&next_id, &fire_time) = next_fire
+        let mut next_fire: HashMap<u8, std::time::Instant> = rates
             .iter()
-            .min_by_key(|(_, time)| *time)
-            .expect("rates is non-empty");
+            .map(|(&id, &rate)| {
+                let interval = std::time::Duration::from_secs_f64(1.0 / rate);
+                let offset = std::time::Duration::from_secs_f64(
+                    rng.random::<f64>() * interval.as_secs_f64(),
+                );
+                (id, now + offset)
+            })
+            .collect();
+        delay_queue.clear();
 
-        // Compute sleep target: min of next rate-fire and next delayed delivery
-        let sleep_target = if let Some(top) = delay_queue.peek() {
-            fire_time.min(top.delivery_time)
-        } else {
-            fire_time
-        };
+        // Event loop for this connection. Breaks with Some(err) when a send
+        // fails (connection dropped) so we reconnect; None on a clean stop
+        // (duration elapsed / Ctrl+C) so the worker exits.
+        let outcome: Option<anyhow::Error> = 'evloop: loop {
+            // Check duration
+            if duration > 0 && start.elapsed().as_secs() >= duration {
+                break 'evloop None;
+            }
 
-        // Sleep if needed, capped at 50ms so inbox is polled at ~20Hz
-        if sleep_target > now {
-            let max_sleep = std::time::Duration::from_millis(50);
-            let actual_sleep = (sleep_target - now).min(max_sleep);
-            tokio::time::sleep(actual_sleep).await;
-            continue; // re-check inbox after sleeping
-        }
+            // Check Ctrl+C
+            if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                break 'evloop None;
+            }
 
-        // Only fire rate-based event if its fire_time has arrived
-        if fire_time > now {
-            continue;
-        }
+            let now = std::time::Instant::now();
 
-        // Generate and send event
-        let event_count = *event_counts.get(&next_id).unwrap_or(&0);
+            // Step 1: Drain inbox from crossbeam channel into delay queue
+            if let Some(ref rx) = receiver {
+                while let Ok(evt) = rx.try_recv() {
+                    delay_queue.push(evt);
+                }
+            }
 
-        // Build PairContext if pair-wise is active
-        let event = if let (Some(ref reg), Some(ref sndrs), Some(ref lat), Some(idx)) =
-            (&registry, &senders, &latency_config, my_index)
-        {
-            let mut ctx = PairContext {
-                registry: reg,
-                senders: sndrs,
-                latency: lat,
-                my_index: idx,
-                pairs_per_node,
+            // Step 2: Emit ready events from delay queue
+            while delay_queue.peek().is_some_and(|e| e.delivery_time <= now) {
+                if let Some(scheduled) = delay_queue.pop() {
+                    if let Err(e) = send_message(&mut stream, &scheduled.event).await {
+                        break 'evloop Some(e);
+                    }
+                }
+            }
+
+            // Find next event to fire
+            let (&next_id, &fire_time) = next_fire
+                .iter()
+                .min_by_key(|(_, time)| *time)
+                .expect("rates is non-empty");
+
+            // Compute sleep target: min of next rate-fire and next delayed delivery
+            let sleep_target = if let Some(top) = delay_queue.peek() {
+                fire_time.min(top.delivery_time)
+            } else {
+                fire_time
             };
-            generate_event(next_id, node_id, sequence, event_count, Some(&mut ctx), &mut rng)?
-        } else {
-            generate_event(next_id, node_id, sequence, event_count, None, &mut rng)?
+
+            // Sleep if needed, capped at 50ms so inbox is polled at ~20Hz
+            if sleep_target > now {
+                let max_sleep = std::time::Duration::from_millis(50);
+                let actual_sleep = (sleep_target - now).min(max_sleep);
+                tokio::time::sleep(actual_sleep).await;
+                continue; // re-check inbox after sleeping
+            }
+
+            // Only fire rate-based event if its fire_time has arrived
+            if fire_time > now {
+                continue;
+            }
+
+            // Generate and send event
+            let event_count = *event_counts.get(&next_id).unwrap_or(&0);
+
+            // Build PairContext if pair-wise is active
+            let event = if let (Some(ref reg), Some(ref sndrs), Some(ref lat), Some(idx)) =
+                (&registry, &senders, &latency_config, my_index)
+            {
+                let mut ctx = PairContext {
+                    registry: reg,
+                    senders: sndrs,
+                    latency: lat,
+                    my_index: idx,
+                    pairs_per_node,
+                };
+                generate_event(next_id, node_id, sequence, event_count, Some(&mut ctx), &mut rng)?
+            } else {
+                generate_event(next_id, node_id, sequence, event_count, None, &mut rng)?
+            };
+
+            if let Err(e) = send_message(&mut stream, &event).await {
+                break 'evloop Some(e);
+            }
+
+            if !quiet {
+                log::debug!(
+                    "Node {} sent event {} (seq {}, count {})",
+                    node_id, next_id, sequence, event_count
+                );
+            }
+
+            sequence += 1;
+            *event_counts.entry(next_id).or_insert(0) += 1;
+
+            // Schedule next fire for this event
+            let rate = rates[&next_id];
+            let interval = std::time::Duration::from_secs_f64(1.0 / rate);
+            next_fire.insert(next_id, std::time::Instant::now() + interval);
         };
 
-        send_message(&mut stream, &event).await?;
-
-        if !quiet {
-            log::debug!("Node {} sent event {} (seq {}, count {})", node_id, next_id, sequence, event_count);
+        match outcome {
+            None => break 'reconnect, // clean stop: duration elapsed or Ctrl+C
+            Some(e) => {
+                if no_reconnect {
+                    return Err(e);
+                }
+                reconnect_attempt += 1;
+                let backoff = reconnect_backoff(reconnect_attempt, reconnect_max_backoff, &mut rng);
+                log::warn!(
+                    "Node {} connection lost after {} events: {} — reconnecting in {:.1}s",
+                    node_id,
+                    sequence,
+                    e,
+                    backoff.as_secs_f64()
+                );
+                if !interruptible_sleep(backoff, running).await {
+                    break 'reconnect;
+                }
+            }
         }
-
-        sequence += 1;
-        *event_counts.entry(next_id).or_insert(0) += 1;
-
-        // Schedule next fire for this event
-        let rate = rates[&next_id];
-        let interval = std::time::Duration::from_secs_f64(1.0 / rate);
-        next_fire.insert(next_id, std::time::Instant::now() + interval);
     }
 
     log::info!(
@@ -585,6 +693,52 @@ async fn run_worker(
     );
 
     Ok(())
+}
+
+/// Sleep for `dur` while polling the shutdown flag, so Ctrl+C aborts promptly.
+/// Returns `true` if the full duration elapsed, `false` if interrupted.
+async fn interruptible_sleep(
+    dur: std::time::Duration,
+    running: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        if !running.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
+    }
+}
+
+/// Open a TCP connection and send the JIP-3 handshake (PROTOCOL_VERSION, NodeInfo).
+async fn connect_and_init(
+    server: &str,
+    node_info: &jam_std_common::telemetry::NodeInfo,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    let mut stream = tokio::net::TcpStream::connect(server).await?;
+    let init_msg = (jam_std_common::telemetry::PROTOCOL_VERSION, node_info);
+    send_message(&mut stream, &init_msg).await?;
+    Ok(stream)
+}
+
+/// Reconnection backoff: exponential from `RECONNECT_BASE_BACKOFF_MS`, capped at
+/// `max_backoff`, with full jitter (uniform in `[0, cap]`). `attempt` starts at
+/// 1 for the first retry. Full jitter spreads a fleet's reconnects so a server
+/// restart doesn't produce a synchronized thundering herd.
+fn reconnect_backoff(
+    attempt: u32,
+    max_backoff: std::time::Duration,
+    rng: &mut impl rand::Rng,
+) -> std::time::Duration {
+    let base = std::time::Duration::from_millis(RECONNECT_BASE_BACKOFF_MS);
+    // base * 2^(attempt-1), saturating; shift capped so it can't overflow.
+    let shift = attempt.saturating_sub(1).min(20);
+    let cap = base.saturating_mul(1u32 << shift).min(max_backoff);
+    cap.mul_f64(rng.random::<f64>())
 }
 
 /// Send a length-prefixed SCALE-encoded message.

@@ -22,6 +22,8 @@ Options:
     --rate <SPEC>        Set frequency for events (see Rate Control)
     --preset <NAME>      Use preset rate configuration (default: realistic)
     --ramp-up <SECS>     Spread connections over SECS window (default: auto ~200/s)
+    --no-reconnect       Fail-fast instead of reconnecting on a dropped connection
+    --reconnect-max-backoff <SECS>  Cap on reconnect backoff (default: 10)
     --list-events        Show all tiers, events, and default rates
 ```
 
