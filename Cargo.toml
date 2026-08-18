@@ -9,8 +9,12 @@ name = "jip-3-spammer"
 path = "src/main.rs"
 
 [dependencies]
-jam-std-common = "0.1.26"
-jam-types = { version = "0.1.26", features = ["std"] }
+# Path dependencies: the telemetry protocol (v1) and event layout must match the
+# polkajam checkout that the target tart instance was built against. The last
+# published registry version (0.1.26) still speaks protocol v0, which current
+# jamtart rejects at handshake.
+jam-std-common = { path = "../polkajam/crates/jam-std-common" }
+jam-types = { path = "../polkajam/crates/jam-types", features = ["std"] }
 
 codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
 bounded-collections = { version = "0.3.2", default-features = false, features = ["jam-codec"] }
@@ -20,6 +24,12 @@ anyhow = "1.0"
 log = "0.4"
 env_logger = { version = "0.10", default-features = false, features = ["color", "auto-color", "humantime"] }
 rand = { version = "0.9", features = ["thread_rng", "small_rng"] }
+rand_distr = "0.5"
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
 ctrlc = { version = "3.4", features = ["termination"] }
 crossbeam-channel = "0.5"
 
