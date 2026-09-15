@@ -39,7 +39,8 @@ impl SimParams {
             ParamsKind::Mini => ProtocolParameters::mini(),
             ParamsKind::Full => ProtocolParameters::full(),
         };
-        let v = proto.val_count as usize;
+        // polkajam ≥ 2026-09 names the validator-set size `max_val_count`.
+        let v = proto.max_val_count as usize;
         let c = proto.core_count as usize;
         let slots = SlotMath {
             slot_period_us: proto.slot_period_sec as u64 * MICROS_PER_SEC,

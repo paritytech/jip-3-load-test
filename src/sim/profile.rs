@@ -96,11 +96,14 @@ pub struct WpKnobs {
     pub early_fail: f64,
     /// Probability a share to one secondary fails (99, no 91 on that side).
     pub share_fail: f64,
-    /// Probability one guarantee send fails (107 instead of 108).
+    /// Probability one guarantee send to an ONLINE recipient fails (107).
+    /// Sends to offline validators always fail, instantly — that share comes
+    /// from `network.active_nodes`, not from here.
     pub guarantee_send_fail: f64,
     /// Probability the guarantee-receive path fails on one receiver (rare).
     pub guarantee_recv_fail: f64,
-    /// Probability one assurance send fails (127).
+    /// Probability one assurance send to an ONLINE recipient fails (127);
+    /// offline recipients always fail instantly.
     pub assurance_send_fail: f64,
     /// Probability a shard request fails (122).
     pub shard_req_fail: f64,
@@ -108,6 +111,28 @@ pub struct WpKnobs {
     pub services: usize,
     /// Builder nodes submitting work packages.
     pub builders: usize,
+
+    // --- Timing shape, measured on live Toaster nodes (2026-09-09) ---
+    /// DistributingAssurance fires this long before the slot boundary, ms
+    /// (polkajam `SEND_ASSURANCE_BEFORE` = 2 s; observed at 4000 ms ± 4).
+    pub assurance_lead_ms: u64,
+    /// All AssuranceSent/Failed events land within this many µs of
+    /// DistributingAssurance — the real node stamps them at send initiation,
+    /// en masse (observed: 76 events within ~1 ms).
+    pub assurance_burst_us: u64,
+    /// AssuranceDistributed after DistributingAssurance, ms range
+    /// (observed 20..600, median 446).
+    pub assurance_done_ms: (u64, u64),
+    /// All SendingGuarantee events land within this many ms of GuaranteeBuilt
+    /// (observed: 77 within 0..25 ms).
+    pub guarantee_burst_ms: u64,
+    /// GuaranteeSent after its SendingGuarantee, ms range (observed 1..6).
+    pub guarantee_ack_ms: (u64, u64),
+    /// GuaranteesDistributed after GuaranteeBuilt, ms range (observed 130..600).
+    pub guarantee_done_ms: (u64, u64),
+    /// LAN delivery for paired receive events, µs range (observed: median
+    /// ~1 ms, tail to 30 ms — a 15% tail is added on top of this range).
+    pub lan_us: (u64, u64),
 }
 
 impl Default for WpKnobs {
@@ -116,12 +141,21 @@ impl Default for WpKnobs {
             per_core_per_slot: 0.83,
             early_fail: 0.12,
             share_fail: 0.25,
-            guarantee_send_fail: 0.154,
+            // Residual (online-recipient) failure shares: the Toaster's
+            // observed 15% was almost entirely its offline validators.
+            guarantee_send_fail: 0.026,
             guarantee_recv_fail: 0.0008,
-            assurance_send_fail: 0.156,
+            assurance_send_fail: 0.0,
             shard_req_fail: 0.003,
             services: 6,
             builders: 4,
+            assurance_lead_ms: 2_000,
+            assurance_burst_us: 1_500,
+            assurance_done_ms: (20, 620),
+            guarantee_burst_ms: 25,
+            guarantee_ack_ms: (1, 6),
+            guarantee_done_ms: (130, 600),
+            lan_us: (300, 4_000),
         }
     }
 }

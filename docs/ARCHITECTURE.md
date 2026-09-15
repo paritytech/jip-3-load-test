@@ -36,7 +36,7 @@ and every structural property that tart checks holds by construction.
 ├────────────────────────────────────────────────────────────┤
 │ 2. Per-node stream state    sim/stream.rs                  │
 │    implicit EventId counter · staging buffer ·             │
-│    bounded live queue (200) with Dropped-merge semantics   │
+│    16 MiB pre-encoded live queue with Dropped accounting   │
 ├────────────────────────────────────────────────────────────┤
 │ 3. Transport                sim/sender.rs, protocol.rs     │
 │    one thread + tokio runtime per online node ·            │
@@ -82,9 +82,25 @@ happens once per WP network-wide); the primary shares with its core's
 secondaries (skipping offline ones entirely — no 98/99, matching the
 reference data); secondaries run their own receive/refine chains and sign;
 with ≥2 signatures the primary builds the guarantee and broadcasts it to
-every other online validator (some sends fail); receivers outside the trio
-then fetch their availability shard from an online trio member. Guarantees
-flow into the next block's outline, into `Status.num_guarantees` per core, and
+**every other validator of the epoch, offline ones included**: all
+`SendingGuarantee` events are stamped within ~25 ms of `GuaranteeBuilt`, acks
+follow within 1–6 ms, sends to offline peers fail instantly, and a small
+residual share of online sends fails with a timeout — the shape measured on
+live Toaster nodes (see `docs/observations/`). Receivers outside the trio
+then fetch their availability shard from an online trio member.
+
+**Broadcast bursts are instantaneous by design.** The real node stamps
+telemetry at send *initiation*: an assurance round is `DistributingAssurance`
+exactly 2 s before the slot boundary followed by all V−1 `AssuranceSent`/
+`AssuranceSendFailed` events within ~1 ms, `AssuranceDistributed` 20–600 ms
+later; receivers see arrivals one LAN hop (~1 ms, tail to 30 ms) after. The
+simulator reproduces these bursts faithfully rather than smoothing them. With
+the pre-#1218 200-entry queue this would have meant `Dropped` every slot at
+V=1023 (1022 events in a millisecond); the 16 MiB byte-bounded queue absorbs
+such a burst (~70 KB) trivially, so at full scale telemetry loss on the node
+side is no longer expected — the remaining pressure point is the server.
+
+Guarantees flow into the next block's outline, into `Status.num_guarantees` per core, and
 into `BlockExecuted.accumulate_costs`; on inclusion, exactly the nodes that
 hold the guarantee discard it (113).
 
@@ -119,15 +135,19 @@ within one node's connection. A stream-walking unit test asserts every
 reference points to an already-assigned id on the same node.
 
 The sender transfers events from staging into the bounded **live queue**
-(200 entries — polkajam's `MAX_REMOTE_EVENT_QUEUE_LEN`) only when their sim
-time has arrived. The live queue implements polkajam's exact overflow
-semantics: the two oldest entries merge into one `Dropped { num }` at the
-head; a head that is already `Dropped` eats one more event and increments
-`num`. Because staging absorbs the world's generation lookahead, the live
-queue overflows only when the socket genuinely cannot drain events that have
-already "happened" — so `Dropped` events are organic, appearing exactly when
-a real node's would (overloaded primaries during segment-fetch bursts produce
-a steady ~0.2% at full load, mirroring the reference network's behavior).
+only when their sim time has arrived. The live queue mirrors polkajam's
+transport as of PR #1218 (2026-09-02): events are pre-encoded into a
+byte-bounded buffer (`MAX_REMOTE_EVENT_QUEUE_BYTES` = 16 MiB); before each
+push the oldest whole messages are evicted until a maximum-size event would
+still fit, and evictions accumulate into one pending `Dropped { num }`
+(timestamp = oldest evicted, `last_timestamp` = newest) that is sent ahead of
+the surviving events on the next flush. Because staging absorbs the world's
+generation lookahead, eviction happens only when the socket genuinely cannot
+drain events that have already "happened" — and with 16 MiB of headroom
+(roughly 100k events) that means a stall of many seconds under heavy load,
+not a burst. Pre-#1218 nodes had a 200-entry queue that merged the two oldest
+events on overflow; the reference Toaster run of August 2026 (1.7 M
+`Dropped`) was produced by that older transport.
 
 ### 3. Transport
 
@@ -140,8 +160,10 @@ like the ~63-of-78 reference run). Each sender:
   "PolkaJam"`, GP version from jam-types, flags = PVM recompiler);
 - paces sends: in live mode an event is sent when the wall clock reaches its
   timestamp (scaled by `--speed`); in `--speed max` (backfill) events flow as
-  fast as a token bucket allows (900/s per node, safely under tart's 1000/s
-  limiter);
+  fast as the socket takes them. An optional per-node token bucket
+  (`--max-send-rate`, default off — a real node has no such cap) exists for
+  targets that run tart's per-node limiter (1000/s + 200 burst); the Toaster
+  deployment runs with that limiter disabled;
 - on reconnect first emits the gap `Dropped { num = <id of the next event> }`
   exactly like polkajam's transport, so the server's implicit-id counting —
   and therefore every earlier parent reference — stays valid across

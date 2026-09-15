@@ -54,22 +54,26 @@ Key options:
   duration reproduce byte-identical per-node event streams.
 - `--start <rfc3339>` + `--speed max` — backfill: timestamps are embedded in
   events and tart stores them as the event time, so history can be written
-  at wire speed (a token bucket keeps each node under tart's 1000 events/s
-  limiter). `--speed 2.5` style multipliers also work for accelerated live
-  runs.
+  at wire speed (add `--max-send-rate 900` if the target tart runs its
+  per-node limiter). `--speed 2.5` style multipliers also work for
+  accelerated live runs.
 - `--duration <secs>` — length of the generated timeline in **sim** seconds
   (0 = until Ctrl+C).
+- `--max-send-rate <n>` — optional per-node send cap in events/s (0 =
+  unlimited, like a real node). Set to ~900 only when the target tart runs
+  with its per-node rate limiter enabled; the Toaster deployment does not.
 
 At shutdown the simulator prints the accounting line:
 
 ```
-sim finished: generated N, sent M, merged into Dropped K
+sim finished: generated N, sent M, evicted into Dropped K
 ```
 
-`generated = sent + merged − <Dropped entries>`; a small `merged` share at
-full load (~0.2%) is organic and authentic — overloaded primaries merging
-their queue exactly like real polkajam nodes do (the reference network ran at
-0.1%+ constantly). A large share means the target server cannot keep up.
+`generated = sent + evicted − <Dropped events>`. With the 16 MiB per-node
+queue (polkajam PR #1218) evictions only happen when a socket stalls for a
+long time — a non-zero `evicted` means the target server could not keep up,
+not a burst. (Pre-#1218 nodes with the 200-entry queue dropped ~0.2% at full
+load; the August 2026 Toaster reference carries that signature.)
 
 ## Fitting a profile: `calibrate`
 
@@ -113,7 +117,10 @@ Three layers of checks, exit code 1 if any fails:
    transfers = 2× requests, funnel sums (`SendingGuarantee = failed + sent`,
    `BlockExecuted = Authored + Importing`, …).
 2. **Failure shares** against the profile (guarantee/assurance/segment/share/
-   dial failure rates), absolute tolerance `--share-tolerance`.
+   dial failure rates), absolute tolerance `--share-tolerance`. Broadcast
+   failure shares on the wire are `offline share + residual`: pass `--params`
+   matching the run so the offline share (`network.active_nodes` vs the
+   validator count) is sized correctly.
 3. **Event mix** against the profile's `[reference_mix]`, relative tolerance
    `--mix-tolerance` for types above `--mix-floor`.
 
@@ -139,8 +146,12 @@ TOML overlay over built-in defaults; unknown keys are rejected. Sections:
   only online nodes author).
 - `[chain]` — missed slots, latency ranges (`[min_ms, max_ms]` pairs),
   gossip density, finality lag bounds, clock drift, tickets per block.
-- `[wp]` — WP intensity per core per slot, pipeline failure shares, service
-  and builder counts.
+- `[wp]` — WP intensity per core per slot, pipeline failure shares (the
+  guarantee/assurance send-failure knobs are *residual* rates among online
+  recipients — offline recipients always fail), service and builder counts,
+  and the measured timing shape of broadcasts (assurance lead 2 s, ~1 ms
+  send burst, 20–600 ms round completion; guarantee burst 25 ms, acks 1–6 ms,
+  LAN hop ~1 ms with a tail to 30 ms).
 - `[segments]` — import-fetch share, batches per WP, failure/escalation
   shares.
 - `[audit]` — auditors per report, bundle-shard path share, failure share.

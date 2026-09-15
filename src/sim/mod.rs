@@ -69,6 +69,11 @@ pub struct SimArgs {
     #[arg(long, default_value_t = 0.25)]
     load_scale: f64,
 
+    /// Per-node send cap in events/s (0 = unlimited, like a real node). Set
+    /// to ~900 when the target tart runs with its per-node rate limiter on
+    #[arg(long, default_value_t = 0.0)]
+    max_send_rate: f64,
+
     /// Suppress per-node connection logging
     #[arg(long, short)]
     quiet: bool,
@@ -160,6 +165,7 @@ pub fn run(args: SimArgs) -> anyhow::Result<()> {
             node_created_at: start_ts,
             connect_delay: ramp_interval * n as u32,
             reconnect_max_backoff,
+            max_send_rate: args.max_send_rate,
             quiet: args.quiet,
         };
         handles.push(sender::spawn(
@@ -199,18 +205,18 @@ pub fn run(args: SimArgs) -> anyhow::Result<()> {
     let sent: u64 = shared.iter().map(|s| s.sent_count.load(Ordering::Relaxed)).sum();
     let merged: u64 = shared
         .iter()
-        .map(|s| s.queue.lock().expect("queue lock poisoned").live.merged_away)
+        .map(|s| s.queue.lock().expect("queue lock poisoned").live.evicted)
         .sum();
     log::info!(
-        "sim finished: generated {}, sent {}, merged into Dropped {}",
+        "sim finished: generated {}, sent {}, evicted into Dropped {}",
         generated,
         sent,
         merged
     );
     if merged > 0 {
         log::warn!(
-            "{} events were merged into Dropped entries — the senders could not keep up; \
-             lower the load or check the server",
+            "{} events were evicted from a node's 16 MiB telemetry queue into Dropped — \
+             a socket stalled for a long time; check the server",
             merged
         );
     }

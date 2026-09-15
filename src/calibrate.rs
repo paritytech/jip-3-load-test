@@ -93,8 +93,20 @@ pub fn run(args: CalibrateArgs) -> anyhow::Result<()> {
     } else {
         Profile::default().wp.early_fail
     };
-    p.wp.guarantee_send_fail = ratio(n(107), n(107) + n(108)).clamp(0.0, 0.9);
-    p.wp.assurance_send_fail = ratio(n(127), n(127) + n(128)).clamp(0.0, 0.9);
+    // Broadcasts go to ALL other validators and sends to offline ones always
+    // fail, so the observed failure shares contain the offline share; store
+    // the residual (online-recipient) rate — the simulator re-adds the
+    // offline effect from `network.active_nodes`.
+    let p_off = if v > 1 { (v as f64 - v_active).max(0.0) / (v as f64 - 1.0) } else { 0.0 };
+    let residual = |observed: f64| -> f64 {
+        if p_off < 1.0 {
+            ((observed - p_off) / (1.0 - p_off)).clamp(0.0, 0.9)
+        } else {
+            0.0
+        }
+    };
+    p.wp.guarantee_send_fail = residual(ratio(n(107), n(107) + n(108)));
+    p.wp.assurance_send_fail = residual(ratio(n(127), n(127) + n(128)));
     p.wp.shard_req_fail = ratio(n(122), n(122) + n(123)).clamp(0.0, 0.9);
     p.wp.guarantee_recv_fail = ratio(n(111), n(110)).clamp(0.0, 0.5);
 

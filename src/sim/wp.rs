@@ -247,39 +247,50 @@ impl World {
             self_id: built.clone(),
         });
 
-        let mut last_send_t = t_105;
+        // Broadcast to EVERY other validator of the epoch, offline ones
+        // included: the real node stamps all SendingGuarantee events within
+        // ~25 ms of GuaranteeBuilt (observed on Toaster), acks follow within
+        // milliseconds, and sends to offline peers fail immediately.
+        let burst_us = self.params.p.wp.guarantee_burst_ms * MICROS_PER_MS;
         let mut holders: Vec<u16> = vec![primary];
-        for recipient in 0..act {
+        for recipient in 0..self.params.v as u16 {
             if recipient == primary {
                 continue;
             }
             let sending = id_slot();
-            let t_106 = t_105 + ms(2..350, &mut self.rng);
+            let t_106 = t_105 + self.rng.random_range(0..burst_us.max(1));
             self.schedule(t_106, primary, Emit::SendingGuarantee {
                 built: built.clone(),
                 recipient,
                 self_id: sending.clone(),
             });
+            let offline = recipient >= act;
+            if offline {
+                let t_107 = t_106 + ms(1..6, &mut self.rng);
+                self.schedule(t_107, primary, Emit::GuaranteeSendFailed { sending });
+                continue;
+            }
             if self.rng.random::<f64>() < self.params.p.wp.guarantee_send_fail {
+                // Online but failing: a timeout-shaped failure.
                 let t_107 = t_106 + ms(300..3_000, &mut self.rng);
                 self.schedule(t_107, primary, Emit::GuaranteeSendFailed { sending });
                 continue;
             }
-            let t_108 = t_106 + ms(8..45, &mut self.rng);
+            let ack = self.params.p.wp.guarantee_ack_ms;
+            let t_108 = t_106 + ms(ack.0..ack.1.max(ack.0 + 1), &mut self.rng);
             self.schedule(t_108, primary, Emit::GuaranteeSent { sending });
-            last_send_t = last_send_t.max(t_108);
 
-            // Receiver side.
+            // Receiver side, one LAN hop away.
             let receiving = id_slot();
-            let t_110 = t_106 + ms(4..25, &mut self.rng);
+            let t_110 = t_106 + self.lan_delay();
             self.schedule(t_110, recipient, Emit::RecvGuarantee {
                 primary,
                 self_id: receiving.clone(),
             });
             if self.rng.random::<f64>() < self.params.p.wp.guarantee_recv_fail {
-                continue; // 111 is rare enough to reserve for phase 3 polish
+                continue; // 111 is rare enough to reserve for later polish
             }
-            let t_112 = t_110 + ms(3..15, &mut self.rng);
+            let t_112 = t_110 + ms(1..5, &mut self.rng);
             self.schedule(t_112, recipient, Emit::GuaranteeReceived {
                 wp,
                 parent: receiving,
@@ -293,8 +304,21 @@ impl World {
         }
         self.wps.get_mut(&wp).expect("just inserted").holders = holders;
 
-        let t_109 = last_send_t + ms(5..30, &mut self.rng);
+        let done = self.params.p.wp.guarantee_done_ms;
+        let t_109 = t_105 + ms(done.0..done.1.max(done.0 + 1), &mut self.rng);
         self.schedule(t_109, primary, Emit::GuaranteesDistributed { parent: submission });
+    }
+
+    /// One LAN hop for paired send/receive events: mostly ~1 ms with a tail
+    /// to ~30 ms (observed on Toaster).
+    pub(super) fn lan_delay(&mut self) -> SimTime {
+        let (lo, hi) = self.params.p.wp.lan_us;
+        let base = self.rng.random_range(lo..hi.max(lo + 1));
+        if self.rng.random::<f64>() < 0.15 {
+            base + self.rng.random_range(0..26_000)
+        } else {
+            base
+        }
     }
 
     /// One assurer pulls its shard from a random online trio member.
@@ -354,26 +378,34 @@ impl World {
         bits.sort_unstable();
         bits.dedup();
 
+        // Shape measured on live Toaster nodes: DistributingAssurance lands
+        // exactly `assurance_lead_ms` before the boundary (±4 ms); every
+        // AssuranceSent/Failed is stamped within ~1 ms of it (the node logs the
+        // send at initiation, to ALL other validators, offline ones failing
+        // instantly); AssuranceDistributed follows 20–600 ms later.
         let boundary = self.params.slots.slot_start(slot + 1);
-        let base = boundary.saturating_sub(2 * super::time::MICROS_PER_SEC);
-        let v = self.act();
+        let base = boundary.saturating_sub(self.params.p.wp.assurance_lead_ms * MICROS_PER_MS);
+        let act = self.act();
+        let v_total = self.params.v as u16;
+        let burst_us = self.params.p.wp.assurance_burst_us.max(1);
+        let done = self.params.p.wp.assurance_done_ms;
 
-        for node in 0..v {
+        for node in 0..act {
             let distributing = id_slot();
-            let t_126 = base + self.rng.random_range(0..120) * MICROS_PER_MS;
+            let t_126 = base + self.rng.random_range(0..4_000);
             self.schedule(t_126, node, Emit::Assuring {
                 anchor_slot,
                 bits: bits.clone(),
                 self_id: distributing.clone(),
             });
 
-            let mut last_send = t_126;
-            for recipient in 0..v {
+            for recipient in 0..v_total {
                 if recipient == node {
                     continue;
                 }
-                let t_send = t_126 + self.rng.random_range(1..250) * MICROS_PER_MS;
-                if self.rng.random::<f64>() < self.params.p.wp.assurance_send_fail {
+                let t_send = t_126 + self.rng.random_range(0..burst_us);
+                let offline = recipient >= act;
+                if offline || self.rng.random::<f64>() < self.params.p.wp.assurance_send_fail {
                     self.schedule(t_send, node, Emit::AssuranceSendFailed {
                         parent: distributing.clone(),
                         recipient,
@@ -384,14 +416,13 @@ impl World {
                     parent: distributing.clone(),
                     recipient,
                 });
-                last_send = last_send.max(t_send);
-                let t_recv = t_send + self.rng.random_range(5..40) * MICROS_PER_MS;
+                let t_recv = t_send + self.lan_delay();
                 self.schedule(t_recv, recipient, Emit::AssuranceReceived {
                     sender: node,
                     anchor_slot,
                 });
             }
-            let t_129 = last_send + self.rng.random_range(10..50) * MICROS_PER_MS;
+            let t_129 = t_126 + self.rng.random_range(done.0..done.1.max(done.0 + 1)) * MICROS_PER_MS;
             self.schedule(t_129, node, Emit::AssuranceDistributed { parent: distributing });
         }
     }

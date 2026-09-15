@@ -1,10 +1,12 @@
 //! Per-node transport worker.
 //!
-//! Consumes the node's queue, paces events to the wall clock (live mode) or a
-//! token bucket (max-speed mode, staying under tart's 1000 events/s per-node
-//! limiter), and speaks the JIP-3 wire protocol. On reconnect it emits the gap
-//! `Dropped { num = <id of the next event> }` exactly like polkajam's
-//! transport, so implicit-id references stay valid on the server.
+//! Consumes the node's queue, paces events to the wall clock (live mode) or
+//! pushes them as fast as the socket takes them (max-speed mode; an optional
+//! token bucket exists for targets running tart's per-node limiter), and
+//! writes the pre-encoded JIP-3 messages. Evictions from the byte-bounded
+//! queue are reported ahead of surviving events, and on reconnect the gap
+//! `Dropped { num = <id of the next event> }` is emitted first — both exactly
+//! like polkajam's transport, so implicit-id references stay valid.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,10 +19,13 @@ use super::stream::NodeShared;
 use super::time::SimTime;
 use super::world::{Pace, PaceMode};
 
-/// Sustained send rate in max-speed mode, events/s. Below tart's limiter
-/// (1000/s + 200 burst) with margin so nothing is silently dropped.
-const BUCKET_RATE: f64 = 900.0;
-const BUCKET_BURST: f64 = 150.0;
+/// Write an already-framed message (the queue pre-encodes events, like polkajam).
+async fn write_framed(stream: &mut tokio::net::TcpStream, bytes: &[u8]) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
 
 pub struct SenderCfg {
     pub node_idx: u16,
@@ -30,23 +35,33 @@ pub struct SenderCfg {
     pub node_created_at: SimTime,
     pub connect_delay: std::time::Duration,
     pub reconnect_max_backoff: std::time::Duration,
+    /// Per-node send cap, events/s; 0 = unlimited (a real node has no such
+    /// cap — set ≤1000 only against a tart with its per-node limiter on).
+    pub max_send_rate: f64,
     pub quiet: bool,
 }
 
+/// Optional token bucket in front of the socket.
 struct Bucket {
+    rate: f64,
+    burst: f64,
     tokens: f64,
     last: std::time::Instant,
 }
 
 impl Bucket {
-    fn new() -> Self {
-        Self { tokens: BUCKET_BURST, last: std::time::Instant::now() }
+    fn new(rate: f64) -> Self {
+        let burst = (rate / 6.0).max(1.0);
+        Self { rate, burst, tokens: burst, last: std::time::Instant::now() }
     }
 
     fn try_take(&mut self) -> bool {
+        if self.rate <= 0.0 {
+            return true;
+        }
         let now = std::time::Instant::now();
-        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * BUCKET_RATE)
-            .min(BUCKET_BURST);
+        self.tokens = (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate)
+            .min(self.burst);
         self.last = now;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -81,7 +96,7 @@ async fn run_sender(
     cfg: SenderCfg,
 ) -> anyhow::Result<()> {
     let mut rng = rand::rng();
-    let mut bucket = Bucket::new();
+    let mut bucket = Bucket::new(cfg.max_send_rate);
     let mut reconnect_attempt: u32 = 0;
 
     if !cfg.connect_delay.is_zero() && !interruptible_sleep(cfg.connect_delay, &running).await {
@@ -128,11 +143,11 @@ async fn run_sender(
             }
 
             // Transfer events whose sim time has arrived from staging into the
-            // bounded live queue (where polkajam's Dropped-merge semantics
+            // byte-bounded live queue (where polkajam's eviction semantics
             // apply), then take the head for sending. The lock is held only
             // for the transfer/pop, never across sleeps.
             enum Step {
-                Send(super::stream::QueuedEvent),
+                Send(Option<TimestampedEvent>, super::stream::QueuedEvent),
                 Empty,
                 NotDue(std::time::Instant),
                 Throttled,
@@ -145,7 +160,7 @@ async fn run_sender(
                     PaceMode::Live { .. } => {
                         // An event enters the real node's queue the moment it
                         // happens — even if the socket is stalled (that is
-                        // what makes organic Dropped merges possible).
+                        // what makes organic evictions possible).
                         while let Some(head) = q.staging.front() {
                             let due = pace
                                 .wall_for(head.event.timestamp.0)
@@ -161,7 +176,7 @@ async fn run_sender(
                     PaceMode::Max => {
                         // No real time in backfill: the bounded queue is just
                         // a transfer window, never a drop point.
-                        while q.live.len() < super::stream::MAX_QUEUE_LEN {
+                        while q.live.bytes() < super::stream::MAX_QUEUE_BYTES / 4 {
                             match q.staging.pop_front() {
                                 Some(e) => q.live.push(e),
                                 None => break,
@@ -172,7 +187,10 @@ async fn run_sender(
 
                 if q.live.head_ts().is_some() {
                     if bucket.try_take() {
-                        Step::Send(q.live.pop().expect("head checked above"))
+                        // Evictions are reported ahead of the surviving
+                        // events, like the real node's flush prologue.
+                        let dropped = q.live.take_dropped();
+                        Step::Send(dropped, q.live.pop().expect("head checked above"))
                     } else {
                         Step::Throttled
                     }
@@ -202,7 +220,7 @@ async fn run_sender(
                 Step::Throttled => {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
-                Step::Send(entry) => {
+                Step::Send(evicted, entry) => {
                     // A send failure loses this event, like the real node: the
                     // server realigns via the gap Dropped on the next connect,
                     // so implicit-id accounting stays correct.
@@ -227,7 +245,18 @@ async fn run_sender(
                             }
                         }
                     }
-                    match send_message(&mut stream, &entry.event).await {
+                    if let Some(dropped) = evicted {
+                        if let Err(e) = send_message(&mut stream, &dropped).await {
+                            log::warn!(
+                                "sim node {} send failed ({}), event {} lost — reconnecting",
+                                cfg.node_idx,
+                                e,
+                                entry.id
+                            );
+                            continue 'reconnect;
+                        }
+                    }
+                    match write_framed(&mut stream, &entry.bytes).await {
                         Ok(()) => {
                             shared
                                 .sent_watermark

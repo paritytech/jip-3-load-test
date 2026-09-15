@@ -594,7 +594,7 @@ impl World {
             .lock()
             .expect("queue lock poisoned")
             .staging
-            .push_back(QueuedEvent { id, event: TimestampedEvent { timestamp, event } });
+            .push_back(QueuedEvent::new(id, TimestampedEvent { timestamp, event }));
     }
 
     fn build_event(&self, _node: u16, emit: &Emit) -> Event {
@@ -1434,7 +1434,7 @@ mod tests {
                 // produced sits in staging in generation order.
                 let events: Vec<QueuedEvent> = q.staging.drain(..).collect();
                 assert_eq!(q.live.len(), 0, "nothing must reach the live queue without a sender");
-                assert_eq!(q.live.merged_away, 0, "test volume must not overflow the queue");
+                assert_eq!(q.live.evicted, 0, "test volume must not overflow the queue");
                 events
             })
             .collect()
@@ -1538,6 +1538,48 @@ mod tests {
     #[test]
     fn different_seed_changes_streams() {
         assert_ne!(encode_streams(&run_world(7)), encode_streams(&run_world(8)));
+    }
+
+    /// The measured shape of a real node's assurance round (Toaster,
+    /// 2026-09-09): every AssuranceSent/Failed is stamped within the burst
+    /// window of its DistributingAssurance, and the round covers every other
+    /// validator of the epoch exactly once.
+    #[test]
+    fn assurance_round_is_an_instant_burst_to_all_validators() {
+        let streams = run_world(5);
+        let burst_us = crate::sim::profile::Profile::default().wp.assurance_burst_us;
+        let v = streams.len();
+        let mut rounds = 0;
+        for events in &streams {
+            let mut round_start: Option<u64> = None;
+            let mut sends = 0usize;
+            let mut close_round = |sends: &mut usize, rounds: &mut i32| {
+                assert_eq!(*sends, v - 1, "a round must address every other validator");
+                *rounds += 1;
+                *sends = 0;
+            };
+            for qe in events {
+                match &qe.event.event {
+                    Event::DistributingAssurance(_) => {
+                        if round_start.is_some() {
+                            close_round(&mut sends, &mut rounds);
+                        }
+                        round_start = Some(qe.event.timestamp.0);
+                    }
+                    Event::AssuranceSent(_) | Event::AssuranceSendFailed(_) => {
+                        let start = round_start.expect("send before DistributingAssurance");
+                        let dt = qe.event.timestamp.0 - start;
+                        assert!(dt <= burst_us, "AssuranceSent {} µs after Distributing (burst {})", dt, burst_us);
+                        sends += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if round_start.is_some() {
+                close_round(&mut sends, &mut rounds);
+            }
+        }
+        assert!(rounds >= 3, "expected several complete rounds, got {}", rounds);
     }
 
     /// The invariant tart's enricher depends on: every reference resolves to an

@@ -36,6 +36,11 @@ pub struct VerifyArgs {
     #[arg(long)]
     profile: Option<std::path::PathBuf>,
 
+    /// Protocol parameter set the traffic was generated with (sizes the
+    /// offline-recipient share of broadcast failures)
+    #[arg(long, value_enum, default_value_t = crate::sim::params::ParamsKind::Mini)]
+    params: crate::sim::params::ParamsKind,
+
     /// Relative tolerance for pairing checks
     #[arg(long, default_value_t = 0.08)]
     pair_tolerance: f64,
@@ -153,9 +158,20 @@ pub fn run(args: VerifyArgs) -> anyhow::Result<()> {
             num as f64 / den as f64
         }
     };
+    // Broadcast failures observed on the wire = offline recipients (always)
+    // plus the profile's residual rate among online ones.
+    let v_total: usize = match args.params {
+        crate::sim::params::ParamsKind::Tiny => 6,
+        crate::sim::params::ParamsKind::Mini => 78,
+        crate::sim::params::ParamsKind::Full => 1023,
+    };
+    let active = profile.network.active_nodes.unwrap_or(v_total).min(v_total);
+    let p_off = (v_total - active) as f64 / (v_total.max(2) - 1) as f64;
+    let effective = |residual: f64| p_off + (1.0 - p_off) * residual;
+
     let shares: &[(&str, f64, f64)] = &[
-        ("guarantee_send_fail", share(n(107), n(107) + n(108)), profile.wp.guarantee_send_fail),
-        ("assurance_send_fail", share(n(127), n(127) + n(128)), profile.wp.assurance_send_fail),
+        ("guarantee_send_fail", share(n(107), n(107) + n(108)), effective(profile.wp.guarantee_send_fail)),
+        ("assurance_send_fail", share(n(127), n(127) + n(128)), effective(profile.wp.assurance_send_fail)),
         ("segment_req_fail", share(n(175), n(173)), profile.segments.req_fail),
         ("share_fail", share(n(99), n(98)), profile.wp.share_fail),
         ("ticket_fail", share(n(83), n(83) + n(84)), profile.background.ticket_fail),

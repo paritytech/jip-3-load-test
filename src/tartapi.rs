@@ -69,8 +69,11 @@ pub fn fetch_network_shape(base: &str) -> anyhow::Result<(usize, usize, u32, u32
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("node parameters missing '{}'", k))
     };
+    // Older tarts serialize the validator-set size as `val_count`, newer
+    // polkajam/tart builds as `max_val_count`.
+    let val_count = get("val_count").or_else(|_| get("max_val_count"))?;
     Ok((
-        get("val_count")? as usize,
+        val_count as usize,
         get("core_count")? as usize,
         get("epoch_period")? as u32,
         get("slot_period_sec")? as u32,

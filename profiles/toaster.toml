@@ -2,6 +2,9 @@
 # window: 2026-08-01T23:00:00Z .. 2026-08-03T08:37:00Z (20170 slots, 1732231605 events)
 # network: V=78, C=26, epoch=600, ~63 active nodes
 # Heuristics: has_imports assumed 0.8, tickets_per_block/finality left at defaults.
+# 2026-09-09: guarantee/assurance send-failure knobs converted to RESIDUAL (online-recipient)
+# rates: the observed 15.4%/15.6% were entirely the 15 offline validators (15/77 = 19.5%),
+# so the residuals are 0. Source tart (192.168.20.84) is no longer reachable to recalibrate.
 
 [network]
 active_nodes = 63
@@ -45,9 +48,9 @@ tickets_per_block_mean = 2.2
 per_core_per_slot = 0.8319743716868159
 early_fail = 0.1782261486911072
 share_fail = 0.24774894891077728
-guarantee_send_fail = 0.1544729943410394
+guarantee_send_fail = 0.0
 guarantee_recv_fail = 0.000795352347292851
-assurance_send_fail = 0.15609378717835953
+assurance_send_fail = 0.0
 shard_req_fail = 0.0030673076936773946
 services = 6
 builders = 4
