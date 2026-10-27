@@ -1304,7 +1304,9 @@ dependencies = [
 
 [[package]]
 name = "jam-std-common"
-version = "0.1.28"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f00e8d8a91334cf68e91fb1dcd0a815909a94b83d71041af3c3510cd29f45ea"
 dependencies = [
  "ark-vrf",
  "arrayvec",
@@ -1329,7 +1331,9 @@ dependencies = [
 
 [[package]]
 name = "jam-types"
-version = "0.1.28"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3786d33c67f2a29311a5d21781f828de51a1fbb34dc6362f4039dea11786bab9"
 dependencies = [
  "atomic-traits",
  "base64",
