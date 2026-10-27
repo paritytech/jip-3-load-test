@@ -13,8 +13,8 @@ path = "src/main.rs"
 # polkajam checkout that the target tart instance was built against. The last
 # published registry version (0.1.26) still speaks protocol v0, which current
 # jamtart rejects at handshake.
-jam-std-common = { path = "../polkajam/crates/jam-std-common" }
-jam-types = { path = "../polkajam/crates/jam-types", features = ["std"] }
+jam-std-common = { version = "0.1.29" }
+jam-types = { version = "0.1.29", features = ["std"] }
 
 codec = { package = "jam-codec", version = "0.1.1", default-features = false, features = ["derive", "max-encoded-len"] }
 bounded-collections = { version = "0.3.2", default-features = false, features = ["jam-codec"] }

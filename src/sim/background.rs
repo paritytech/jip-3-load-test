@@ -24,7 +24,7 @@ impl World {
         }
         let epoch = slot / e + 1;
         let v = self.act();
-        let n_tickets = self.params.proto.tickets_attempts_number as u64;
+        let n_tickets = self.params.proto.max_tickets_per_block as u64;
         let base = self.params.slots.slot_start(slot);
         let window = 3 * self.params.slots.slot_period_us;
 
@@ -48,7 +48,7 @@ impl World {
             });
 
             for (k, &ticket) in tickets.iter().enumerate() {
-                let attempt = (k % self.params.proto.tickets_attempts_number as usize) as u8;
+                let attempt = (k % self.params.proto.max_tickets_per_block as usize) as u8;
                 // Proxy derived from the ticket id, like polkajam's proxy_index.
                 let proxy_pick = u64::from_le_bytes(
                     h32(self.seed, "proxy", ticket, 0)[0..8].try_into().expect("8"),
